@@ -10,6 +10,9 @@
 
 **A terminal Pomodoro timer with an agent-shareable todo list.**
 
+<img width="1680" height="1050" alt="image" src="https://github.com/user-attachments/assets/ac8f4d47-5f53-4a73-85c7-06ce7723b352" />
+
+
 TUiDO is a single-file, dependency-free terminal app that pairs a focus timer
 with a live todo list — your tasks on the left, and on the right a big ASCII
 pomodoro that fills with `#` as the timer runs, with a large countdown below it.
