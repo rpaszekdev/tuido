@@ -947,7 +947,9 @@ class Tui:
                 continue
             t = self.todos[vis[pos]]
             attr = curses.A_DIM if t["done"] else 0
-            if pos == self.sel:
+            # Highlight the selected task only inside the navigation window,
+            # so it appears and fades together with the action menu.
+            if pos == self.sel and time.monotonic() < self._menu_until:
                 attr |= curses.A_REVERSE
             self._put(y, x, text, width, attr)
             self._hover_rows[y] = pos
