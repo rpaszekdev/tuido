@@ -113,10 +113,13 @@ Keys:
 | `q` / `esc` | quit | | |
 
 Long task text wraps to as many lines as it needs. Controls are grouped by side:
-the selected task shows an inline `[e] edit  [x] delete  [d] done` menu, and
-`[a] add` sits under the tasks (left column); `[ -5m ] [ +5m ] [ pause/start ]
-[ reset ] [ timer ]` sit under the pomodoro (right column). All of them are
-clickable with the mouse. Press `?` for the full key list.
+the selected task shows an `[e] edit  [x] delete  [d] done` menu that appears
+while you navigate (`j`/`k` or arrow keys, or mouse hover) and fades away after
+5 seconds. `[a] add` sits under the tasks with a blank line above it, and stays
+pinned to the bottom of the column when the list is long. `[ -5m ] [ +5m ]
+[ pause/start ] [ reset ] [ timer ]` sit under the pomodoro (right column), each
+with its key shown beneath. All of them are clickable. Press `?` for the full
+key list.
 
 ### CLI
 

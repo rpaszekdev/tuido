@@ -509,6 +509,7 @@ class Tui:
         self.editing_add = False
         self.input_text = ""
         self.show_help = False
+        self._menu_until = 0.0
         self.focus_total = get_focus_seconds()
         self._tick_until = 0.0
         self._init_colors()
@@ -798,10 +799,21 @@ class Tui:
                 text = (f"{t['id']:>3} {box} {seg}" if j == 0
                         else " " * prefix_w + seg)
                 lines.append((pos, text, "task", j == 0))
+        # The action menu only shows while you're navigating (arrows / j-k /
+        # mouse hover), then it fades away after 5 seconds.
         last_sel = max((i for i, ln in enumerate(lines) if ln[0] == self.sel),
                        default=-1)
-        if last_sel >= 0:
+        if last_sel >= 0 and time.monotonic() < self._menu_until:
             lines.insert(last_sel + 1, (self.sel, "", "action", False))
+
+        region_h = bottom - y0 + 1
+        # Reserve the bottom rows for the [a] add control (with a blank line
+        # above it) whenever the tasks don't leave room right below them - so
+        # add never disappears, however many tasks there are.
+        reserve = 2 if (len(lines) + 2 > region_h) else 0
+        if region_h - reserve < 1:
+            reserve = max(0, region_h - 1)
+        avail = max(1, region_h - reserve)
 
         # Scroll so the selected task's whole block stays on screen.
         sel_first = max((i for i, ln in enumerate(lines) if ln[0] == self.sel),
@@ -817,8 +829,9 @@ class Tui:
         if sel_first < scroll:
             scroll = sel_first
         scroll = max(0, min(scroll, max(0, len(lines) - avail)))
+        shown = lines[scroll:scroll + avail]
 
-        for row, (pos, text, kind, first) in enumerate(lines[scroll:scroll + avail]):
+        for row, (pos, text, kind, first) in enumerate(shown):
             y = y0 + row
             if kind == "action":
                 menu = "[e] edit   [x] delete   [d] done"
@@ -838,10 +851,10 @@ class Tui:
             self._put(y, x, text, width, attr)
             self._hover_rows[y] = pos
 
-        # New-task control: sits under the tasks, in the empty space below the
-        # last one (not in a global bottom bar).
+        # [a] add: one blank line below the last task, pinned to the bottom of
+        # the column when the list is long so it stays reachable.
         if not self.editing_add:
-            add_y = y0 + min(len(lines) - scroll, avail)
+            add_y = bottom if reserve else y0 + len(shown) + 1
             if add_y <= bottom:
                 self._control(add_y, x + 2, "[a] add", self._begin_add, self._cp(4))
 
@@ -985,6 +998,7 @@ class Tui:
     def _move(self, delta):
         self.sel += delta
         self._clamp_sel()
+        self._menu_until = time.monotonic() + 5.0
 
     def _begin_add(self):
         self.editing_add = True
@@ -1184,8 +1198,10 @@ class Tui:
                 self._move(-1)
             elif ch == ord("g"):
                 self.sel = 0
+                self._menu_until = time.monotonic() + 5.0
             elif ch == ord("G"):
                 self.sel = max(0, len(self._visible()) - 1)
+                self._menu_until = time.monotonic() + 5.0
             elif ch == ord("c"):
                 self._clear_done()
             elif ch == ord("v"):
@@ -1208,6 +1224,7 @@ class Tui:
         if pos is not None:
             self.sel = pos
             self._clamp_sel()
+            self._menu_until = time.monotonic() + 5.0
 
     # --------------------------------------------------------------- timer
     def start(self):
