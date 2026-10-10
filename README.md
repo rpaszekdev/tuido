@@ -50,11 +50,16 @@ On `d`, the check briefly replaces the tomato while the countdown stays put.
   large ASCII countdown below it that scales to your terminal.
 - **Add time on the fly** — `+` / `-` (or the on-screen `[ -5m ]` / `[ +5m ]`
   buttons) extend or trim the current session by 5 minutes.
-- **Focus stats** — the top-right corner shows cumulative focused time and the
-  number of tasks completed. Both are saved next to your tasks in
+- **Focus stats** — the top-right corner shows today's focused time, all-time
+  total and the number of tasks completed. Both are saved next to your tasks in
   `todos.json`, so they survive restarts (`tuido focus` / `tuido status`).
-  Pressing `d` flashes a big ASCII checkmark across the whole right column
-  for a second as feedback.
+  Pressing `d` flashes a big ASCII checkmark across the visualizer for a second.
+- **Daily log** — every finished work session is recorded by date (focus time,
+  pomodoros, tasks done) in `sessions.json`; today's total is shown up top and
+  `tuido sessions` prints the history.
+- **Ideas** — press `i` anywhere in the TUI to open a scratchpad and capture a
+  thought; it's appended to `ideas.md` (the overlay shows the exact path).
+  `tuido idea "..."` and `tuido ideas` do the same from the shell.
 - **Edit and remember your timer** — press `t` (or click `[ timer ]`) to set the
   work / short / long / cycles lengths; they are saved to `settings.json` and
   reused next launch. Also settable from the CLI: `tuido config work 50`.
@@ -110,7 +115,7 @@ Keys:
 | `j` / `k` | move selection | `t` | edit timer lengths |
 | `g` / `G` | jump to top / bottom | `c` | clear completed |
 | `?` | help overlay | `v` | hide / show done |
-| `q` / `esc` | quit | | |
+| `i` | ideas scratchpad | `q` / `esc` | quit |
 
 Long task text wraps to as many lines as it needs. Controls are grouped by side:
 the selected task shows an `[e] edit  [x] delete  [d] done` menu that appears
@@ -136,6 +141,9 @@ tuido clear                         # delete completed
 tuido clear-all --yes               # wipe everything
 tuido status [--json]               # live timer + focus time + counts
 tuido focus [--reset] [--json]      # cumulative focused time
+tuido sessions [--json]             # daily focus log (focus time / pomodoros / tasks)
+tuido idea "text"                   # save an idea (also reads stdin)
+tuido ideas [--path]                # list ideas / print the ideas file path
 
 tuido config                        # show remembered timer lengths
 tuido config work 50                # set + remember (minutes)
@@ -167,6 +175,8 @@ Everything lives in `~/.local/share/tuido/`:
 | file | purpose |
 |------|---------|
 | `todos.json` | your todo list, plus cumulative `focus_seconds` and the done counter |
+| `sessions.json` | per-day log: focus seconds, pomodoros, tasks done |
+| `ideas.md` | free-form ideas/thoughts captured with `i` |
 | `settings.json` | remembered timer lengths (work / short / long / cycles) |
 | `state.json` | live timer state, written while a TUI runs, removed on exit |
 | `.lock` | advisory lock guarding concurrent writes |

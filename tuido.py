@@ -13,6 +13,8 @@
 Data lives as JSON under ~/.local/share/tuido/:
   todos.json     your todo list (source of truth). Also stores the cumulative
                  focused seconds and the done-tasks counter, shown top-right.
+  sessions.json  a per-day log of focus time, pomodoros and tasks done
+  ideas.md       free-form ideas/thoughts you capture with the `i` key
   state.json     the live timer state, written by a running TUI
   settings.json  remembered timer lengths (set in the TUI with `t`)
 
@@ -43,12 +45,14 @@ import textwrap
 import time
 
 APP_NAME = "tuido"
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "tuido")
 TODOS_FILE = os.path.join(DATA_DIR, "todos.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
+SESSIONS_FILE = os.path.join(DATA_DIR, "sessions.json")
+IDEAS_FILE = os.path.join(DATA_DIR, "ideas.md")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 OLD_DATA_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pomodoro")
 
@@ -116,6 +120,9 @@ Usage:
   {APP_NAME} clear-all --yes            delete every todo
   {APP_NAME} status [--json]            show live timer + focus time + counts
   {APP_NAME} focus [--reset] [--json]   show or reset cumulative focused time
+  {APP_NAME} sessions [--json]          show the daily focus log
+  {APP_NAME} idea "text"                save an idea (also reads stdin)
+  {APP_NAME} ideas [--path]             list saved ideas / print the file path
   {APP_NAME} config [key] [value]       show or set remembered timer lengths
   {APP_NAME} path                       print the data file paths
   {APP_NAME} banner                     print the banner
@@ -132,7 +139,7 @@ Timer options for the TUI (override remembered settings for one run):
 Keys:
   space start/pause   s skip   r reset   a add   d done   x delete
   e edit task   t edit timer lengths (remembered)   +/- add or remove 5 minutes
-  j/k move   g/G top/bottom   c clear done   v view   ? help   q/esc quit
+  j/k move   g/G top/bottom   c clear done   v view   i ideas   ? help   q/esc quit
 """
 
 
@@ -309,6 +316,68 @@ def effective_settings():
         if key in saved:
             out[key] = saved[key]
     return out
+
+
+# --------------------------------------------------------------------------- #
+# daily session log + ideas scratchpad
+# --------------------------------------------------------------------------- #
+def today_str():
+    return time.strftime("%Y-%m-%d")
+
+
+def load_sessions():
+    try:
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_sessions(data):
+    with contextlib.suppress(OSError):
+        _atomic_write(SESSIONS_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def update_sessions(focus=0, pomodoros=0, tasks_done=0):
+    """Add to today's running totals and persist the daily log."""
+    with _locked():
+        data = load_sessions()
+        day = data.setdefault(today_str(), {"focus_seconds": 0, "pomodoros": 0,
+                                            "tasks_done": 0})
+        day["focus_seconds"] = int(day.get("focus_seconds", 0)) + int(focus)
+        day["pomodoros"] = int(day.get("pomodoros", 0)) + int(pomodoros)
+        day["tasks_done"] = max(0, int(day.get("tasks_done", 0)) + int(tasks_done))
+        save_sessions(data)
+        return dict(day)
+
+
+def today_session():
+    day = load_sessions().get(today_str(), {})
+    return {"focus_seconds": int(day.get("focus_seconds", 0)),
+            "pomodoros": int(day.get("pomodoros", 0)),
+            "tasks_done": int(day.get("tasks_done", 0))}
+
+
+def append_idea(text):
+    """Append a timestamped idea/thought to the ideas markdown file."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with _locked():
+        if not os.path.exists(IDEAS_FILE):
+            with open(IDEAS_FILE, "w", encoding="utf-8") as fh:
+                fh.write("# Ideas\n\n")
+        with open(IDEAS_FILE, "a", encoding="utf-8") as fh:
+            fh.write(f"- [{time.strftime('%Y-%m-%d %H:%M')}] {text.strip()}\n")
+
+
+def read_ideas(limit=10):
+    try:
+        with open(IDEAS_FILE, "r", encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    ideas = [ln for ln in lines if ln.startswith("- [")]
+    return ideas[-limit:]
 
 
 # --------------------------------------------------------------------------- #
@@ -510,6 +579,9 @@ class Tui:
         self.input_text = ""
         self.show_help = False
         self._menu_until = 0.0
+        self.ideating = False
+        self.idea_text = ""
+        self.today = today_session()
         self.focus_total = get_focus_seconds()
         self._tick_until = 0.0
         self._init_colors()
@@ -606,12 +678,13 @@ class Tui:
 
         self._add(0, 1, "T U i D O", acc | curses.A_BOLD)
         spin = SPINNER[tick % len(SPINNER)] if self.running else "*"
-        focus = self.focus_total
-        if self.phase == "work":
-            focus += max(0.0, self.total - self.remaining)
+        live = max(0.0, self.total - self.remaining) if self.phase == "work" else 0.0
+        today = self.today.get("focus_seconds", 0) + live
+        alltime = self.focus_total + live
         done_n = sum(1 for t in self.todos if t["done"])
         status = (f"{'running' if self.running else 'paused'} {spin}   "
-                  f"focus {format_duration(focus)}   {done_n} done ")
+                  f"today {format_duration(today)}   all {format_duration(alltime)}   "
+                  f"{done_n} done ")
         self._add(0, max(w - len(status) - 1, 1), status, curses.A_DIM)
 
         top = 2
@@ -625,6 +698,8 @@ class Tui:
         self._draw_footer(h, w)
         if self.show_help:
             self._draw_help()
+        if self.ideating:
+            self._draw_ideas()
 
     def _draw_footer(self, h, w):
         if self.editing_add:
@@ -692,6 +767,32 @@ class Tui:
             y = y0 + 1 + i
             self._add(y, x0, "|", curses.A_DIM)
             self._add(y, x0 + 2, text.ljust(inner), attr)
+            self._add(y, x0 + box_w - 2, "|", curses.A_DIM)
+        self._add(y0 + len(rows) + 1, x0, border, curses.A_DIM)
+
+    def _draw_ideas(self):
+        h, w = self.scr.getmaxyx()
+        ideas = read_ideas(10)
+        rows = [("IDEAS", curses.A_BOLD),
+                (f"path: {IDEAS_FILE}", curses.A_DIM),
+                ("", 0)]
+        rows.extend((ln, 0) for ln in ideas)
+        rows.append(("", 0))
+        rows.append((f"new idea: {self.idea_text}",
+                     self._cp(4) | curses.A_BOLD))
+        rows.append(("Enter save  \u00b7  Esc close", curses.A_DIM))
+        inner = min(max(len(t) for t, _ in rows), max(10, w - 6))
+        box_w = inner + 4
+        x0 = max(0, (w - box_w) // 2)
+        y0 = max(1, (h - (len(rows) + 2)) // 2)
+        for i in range(len(rows) + 2):
+            self._add(y0 + i, x0, " " * box_w, 0)
+        border = "+" + "-" * (box_w - 2) + "+"
+        self._add(y0, x0, border, curses.A_DIM)
+        for i, (text, attr) in enumerate(rows):
+            y = y0 + 1 + i
+            self._add(y, x0, "|", curses.A_DIM)
+            self._add(y, x0 + 2, text[:inner].ljust(inner), attr)
             self._add(y, x0 + box_w - 2, "|", curses.A_DIM)
         self._add(y0 + len(rows) + 1, x0, border, curses.A_DIM)
 
@@ -978,6 +1079,7 @@ class Tui:
         new = not cur["done"]
         if new:
             self._tick_until = time.monotonic() + 1.0   # flash a tick for 1s
+        self.today = update_sessions(tasks_done=1 if new else -1)
         store_set_done([tid], new)
         self._reload(force=True)
         self._message_set(f"#{tid} " + ("done" if new else "reopened"))
@@ -1022,6 +1124,21 @@ class Tui:
             self.input_text = self.input_text[:-1]
         elif 32 <= ch < 127:
             self.input_text += chr(ch)
+
+    def _handle_idea_key(self, ch):
+        if ch == 27:                                  # Esc closes
+            self.ideating = False
+            self.idea_text = ""
+        elif ch in (10, 13, curses.KEY_ENTER):        # Enter saves + stays open
+            text = self.idea_text.strip()
+            self.idea_text = ""
+            if text:
+                append_idea(text)
+                self._message_set("idea saved")
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.idea_text = self.idea_text[:-1]
+        elif 32 <= ch < 127:
+            self.idea_text += chr(ch)
 
     def _prompt(self, label, initial=""):
         h, w = self.scr.getmaxyx()
@@ -1161,6 +1278,9 @@ class Tui:
             if self.editing_add:
                 self._handle_add_key(ch)
                 return
+            if self.ideating:
+                self._handle_idea_key(ch)
+                return
             if self.show_help:
                 self.show_help = False
                 return
@@ -1172,6 +1292,9 @@ class Tui:
                 return
             if ch == ord("?"):
                 self.show_help = True
+            elif ch == ord("i"):
+                self.ideating = True
+                self.idea_text = ""
             elif ch == ord(" "):
                 self._toggle()
             elif ch == ord("s"):
@@ -1272,6 +1395,7 @@ class Tui:
         if finished == "work":
             self.completed += 1
             self.focus_total = add_focus_seconds(int(self.total))
+            self.today = update_sessions(focus=int(self.total), pomodoros=1)
         self.phase = next_phase(finished, self.completed, self.cfg["cycles"])
         self.total = float(self.durations[self.phase])
         self.remaining = self.total
@@ -1527,6 +1651,59 @@ def cmd_focus(argv):
     return 0
 
 
+def cmd_sessions(argv):
+    p = argparse.ArgumentParser(prog=f"{APP_NAME} sessions",
+                                description="Show the daily focus log.")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    data = load_sessions()
+    if a.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+        return 0
+    if not data:
+        print("(no sessions yet)")
+        return 0
+    for day in sorted(data):
+        d = data[day]
+        print(f"{day}  focus {format_duration(d.get('focus_seconds', 0))}  "
+              f"{d.get('pomodoros', 0)} pomodoros  {d.get('tasks_done', 0)} tasks done")
+    return 0
+
+
+def cmd_idea(argv):
+    p = argparse.ArgumentParser(prog=f"{APP_NAME} idea",
+                                description="Save an idea or thought.")
+    p.add_argument("text", nargs="*")
+    a = p.parse_args(argv)
+    text = " ".join(a.text).strip()
+    if not text and not sys.stdin.isatty():
+        text = sys.stdin.read().strip()
+    if not text:
+        print(f"{APP_NAME}: nothing to save (pass text or pipe stdin)", file=sys.stderr)
+        return 2
+    append_idea(text)
+    print(f"saved to {IDEAS_FILE}")
+    return 0
+
+
+def cmd_ideas(argv):
+    p = argparse.ArgumentParser(prog=f"{APP_NAME} ideas",
+                                description="List saved ideas.")
+    p.add_argument("--path", action="store_true", help="print the ideas file path")
+    a = p.parse_args(argv)
+    if a.path:
+        print(IDEAS_FILE)
+        return 0
+    print(f"# {IDEAS_FILE}")
+    items = read_ideas(20)
+    if not items:
+        print('(no ideas yet - press i in the TUI, or: tuido idea "..." )')
+        return 0
+    for ln in items:
+        print(ln)
+    return 0
+
+
 def cmd_config(argv):
     p = argparse.ArgumentParser(prog=f"{APP_NAME} config",
                                 description="Show or set remembered timer lengths (minutes).")
@@ -1573,6 +1750,8 @@ def cmd_path(argv):
     print(f"  todos:    {TODOS_FILE}")
     print(f"  state:    {STATE_FILE}")
     print(f"  settings: {SETTINGS_FILE}")
+    print(f"  sessions: {SESSIONS_FILE}")
+    print(f"  ideas:    {IDEAS_FILE}")
     return 0
 
 
@@ -1604,6 +1783,9 @@ DISPATCH = {
     "status": cmd_status,
     "config": cmd_config,
     "focus": cmd_focus,
+    "sessions": cmd_sessions,
+    "idea": cmd_idea,
+    "ideas": cmd_ideas,
     "settings": cmd_config,
     "path": cmd_path,
     "banner": cmd_banner,
