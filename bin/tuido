@@ -1,0 +1,39 @@
+#!/bin/sh
+# TUiDO launcher - runs tuido.py (found next to this script) using a Python
+# that has curses. Works whether invoked in place or via a symlink in PATH.
+# Override the interpreter with TUIDO_PYTHON=/path/to/python.
+set -e
+
+SOURCE=$0
+while [ -h "$SOURCE" ]; do
+    DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    case $SOURCE in
+        /*) ;;
+        *) SOURCE="$DIR/$SOURCE" ;;
+    esac
+done
+DIR=$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)
+APP_PY="$DIR/../tuido.py"
+
+if [ ! -f "$APP_PY" ]; then
+    echo "tuido: app not found at $APP_PY" >&2
+    exit 1
+fi
+
+for py in \
+    "${TUIDO_PYTHON:-}" \
+    python3 \
+    /opt/homebrew/bin/python3 \
+    /Library/Frameworks/Python.framework/Versions/3.12/bin/python3 \
+    /usr/bin/python3
+do
+    [ -n "$py" ] || continue
+    if command -v "$py" >/dev/null 2>&1 && "$py" -c "import curses" >/dev/null 2>&1; then
+        exec "$py" "$APP_PY" "$@"
+    fi
+done
+
+echo "tuido: no Python with curses found." >&2
+echo "hint: install a Python build that ships curses (most do)." >&2
+exit 1

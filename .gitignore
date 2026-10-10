@@ -1,0 +1,8 @@
+# .gitignore
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# user data (lives in ~/.local/share/tuido, never in the repo)
+todos.json
+state.json
