@@ -5,12 +5,17 @@
 |_   _|| | | |(_)|  _ \ / _ \  
   | |  | | | || || | | || | | |
   | |  | |_| || || |_| || |_| |
-  |_|   \___/ |_||____/ \___/  
+  |_|   \___/ |_||____/ \___/
 ```
+
+
+
+<img width="1680" height="1050" alt="image" src="https://github.com/user-attachments/assets/ac8f4d47-5f53-4a73-85c7-06ce7723b352" />
+
+
 
 **A terminal Pomodoro timer with an agent-shareable todo list.**
 
-<img width="1680" height="1050" alt="image" src="https://github.com/user-attachments/assets/ac8f4d47-5f53-4a73-85c7-06ce7723b352" />
 
 
 TUiDO is a single-file, dependency-free terminal app that pairs a focus timer
