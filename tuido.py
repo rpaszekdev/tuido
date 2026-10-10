@@ -3,23 +3,28 @@
 
   TUiDO  =  TUI + todo.  One tool, two faces over the same data:
 
-  * a curses TUI (`tuido`) that puts your todo list on the left and a big
-    ASCII pomodoro on the right that fills with '#' as the focus timer runs
-  * a scriptable CLI (`tuido add/ls/done/rm/...`) over the same todo file,
+  * a curses TUI (`tuido`) that puts your todo list on the left and, on the
+    right, a big ASCII pomodoro that fills with '#' as the focus timer runs -
+    with a large countdown below it
+  * a scriptable CLI (`tuido add/ls/done/rm/config/...`) over the same data,
     so you - or an AI agent working in another pane - can add and complete
     items while the TUI is running. The TUI watches the file and reloads live.
 
 Data lives as JSON under ~/.local/share/tuido/:
-  todos.json   your todo list (source of truth)
-  state.json   the live timer state, written by a running TUI
+  todos.json     your todo list (source of truth). Also stores the cumulative
+                 focused seconds and the done-tasks counter, shown top-right.
+  state.json     the live timer state, written by a running TUI
+  settings.json  remembered timer lengths (set in the TUI with `t`)
 
-`tuido path` prints those paths. `tuido status` shows the timer state and
-todo counts, so an agent can see what you are working on right now.
+`tuido path` prints those paths. `tuido status` shows the timer state, focus
+time and todo counts, so an agent can see what you are working on right now.
 
 Keys in the TUI:
-  space start/pause   s skip   r reset   j/k move   g/G top/bottom
-  a add task   d toggle done   x delete   c clear done   v hide/show done
-  q/esc quit
+  space start/pause   s skip   r reset   a add   d done   x delete
+  e edit the selected task   t edit timer lengths (remembered)
+  + / - add or remove 5 minutes   j/k move   c clear done   v view   q/esc quit
+  Long tasks wrap; hovering a task (or selecting it) shows an [e] edit /
+  [x] delete / [d] done menu for it. The footer buttons are clickable too.
 """
 
 import argparse
@@ -34,14 +39,16 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 
 APP_NAME = "tuido"
-VERSION = "3.1.0"
+VERSION = "3.2.0"
 
 DATA_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "tuido")
 TODOS_FILE = os.path.join(DATA_DIR, "todos.json")
 STATE_FILE = os.path.join(DATA_DIR, "state.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 LOCK_FILE = os.path.join(DATA_DIR, ".lock")
 OLD_DATA_DIR = os.path.join(os.path.expanduser("~"), ".local", "share", "pomodoro")
 
@@ -53,10 +60,13 @@ DEFAULT_LONG = 15
 DEFAULT_CYCLES = 4
 DEFAULT_SOUND = "Glass"
 
+NUM_DEFAULTS = {"work": DEFAULT_WORK, "short": DEFAULT_SHORT,
+                "long": DEFAULT_LONG, "cycles": DEFAULT_CYCLES}
+
 PHASE_NAME = {"work": "WORK", "short": "SHORT BREAK", "long": "LONG BREAK"}
 PHASE_PAIR = {"work": 1, "short": 2, "long": 3}  # curses color-pair numbers
 
-# 3x5 bitmap font for the compact countdown.
+# 3x5 bitmap font for the countdown (scaled up with scale_rows).
 GLYPHS = {
     "0": ("###", "# #", "# #", "# #", "###"),
     "1": ("  #", "  #", "  #", "  #", "  #"),
@@ -104,11 +114,13 @@ Usage:
   {APP_NAME} rm <id...>                 delete todos
   {APP_NAME} clear                      delete completed todos
   {APP_NAME} clear-all --yes            delete every todo
-  {APP_NAME} status [--json]            show live timer + todo counts
+  {APP_NAME} status [--json]            show live timer + focus time + counts
+  {APP_NAME} focus [--reset] [--json]   show or reset cumulative focused time
+  {APP_NAME} config [key] [value]       show or set remembered timer lengths
   {APP_NAME} path                       print the data file paths
   {APP_NAME} banner                     print the banner
 
-Timer options (TUI):
+Timer options for the TUI (override remembered settings for one run):
   -w, --work MIN     work session length         (default {DEFAULT_WORK})
   -b, --break MIN    short break length          (default {DEFAULT_SHORT})
   -l, --long MIN     long break length           (default {DEFAULT_LONG})
@@ -119,7 +131,8 @@ Timer options (TUI):
 
 Keys:
   space start/pause   s skip   r reset   a add   d done   x delete
-  j/k move   g/G top/bottom   c clear done   v view   q/esc quit
+  e edit task   t edit timer lengths (remembered)   +/- add or remove 5 minutes
+  j/k move   g/G top/bottom   c clear done   v view   ? help   q/esc quit
 """
 
 
@@ -129,6 +142,16 @@ Keys:
 def to_seconds(minutes):
     """Convert minutes (int/float) to whole seconds."""
     return int(round(float(minutes) * 60))
+
+
+def format_duration(seconds):
+    """Human-readable focused time: H:MM:SS, or MM:SS under an hour."""
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
 
 
 def next_phase(finished_phase, completed_work, cycles):
@@ -149,6 +172,15 @@ def big_time(text):
     """Render ``text`` (e.g. '25:00') as a list of 5 strings."""
     return [" ".join(GLYPHS.get(ch, GLYPHS[" "])[line] for ch in text)
             for line in range(5)]
+
+
+def scale_rows(rows, factor):
+    """Expand each character and duplicate each row to grow the bitmap."""
+    out = []
+    for row in rows:
+        wide = "".join(ch * factor for ch in row)
+        out.extend([wide] * factor)
+    return out
 
 
 def build_tomato(body_h, max_half, crown=True):
@@ -184,8 +216,37 @@ def render_tomato(rows, crown_n, frac, tick):
     return out
 
 
-def banner_text():
-    return "\n".join(BANNER).rstrip("\n")
+def big_check(width, height, char="#"):
+    """A scalable ASCII checkmark sized to fill a width x height area."""
+    width = max(2, int(width))
+    height = max(2, int(height))
+    grid = [[" "] * width for _ in range(height)]
+    thick = max(2, round(height / 9))
+
+    def stamp(x, y):
+        cy = int(round(y)) - thick // 2
+        cx = int(round(x)) - thick // 2
+        for dy in range(thick):
+            for dx in range(thick):
+                yy, xx = cy + dy, cx + dx
+                if 0 <= yy < height and 0 <= xx < width:
+                    grid[yy][xx] = char
+
+    def seg(x0, y0, x1, y1):
+        steps = int(max(abs(x1 - x0), abs(y1 - y0))) + 1
+        for i in range(steps + 1):
+            t = i / steps
+            stamp(x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+
+    start = (0.12 * width, 0.45 * height)
+    elbow = (0.37 * width, 0.86 * height)
+    tip = (0.90 * width, 0.14 * height)
+    seg(*start, *elbow)
+    seg(*elbow, *tip)
+    return ["".join(row) for row in grid]
+
+
+def banner_text():    return "\n".join(BANNER).rstrip("\n")
 
 
 def _atomic_write(path, text):
@@ -225,6 +286,32 @@ def migrate_old_data():
 
 
 # --------------------------------------------------------------------------- #
+# settings (remembered timer lengths)
+# --------------------------------------------------------------------------- #
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_settings(data):
+    with contextlib.suppress(OSError):
+        _atomic_write(SETTINGS_FILE, json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+
+
+def effective_settings():
+    saved = load_settings()
+    out = dict(NUM_DEFAULTS)
+    for key in NUM_DEFAULTS:
+        if key in saved:
+            out[key] = saved[key]
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # todo store
 # --------------------------------------------------------------------------- #
 def _normalize(data):
@@ -257,6 +344,10 @@ def _normalize(data):
             next_id = tid + 1
     data["next_id"] = next_id
     data["todos"] = todos
+    try:
+        data["focus_seconds"] = int(data.get("focus_seconds", 0) or 0)
+    except (TypeError, ValueError):
+        data["focus_seconds"] = 0
     return data
 
 
@@ -355,6 +446,20 @@ def store_clear_all():
     return n
 
 
+def get_focus_seconds():
+    """Cumulative focused seconds, stored alongside the tasks."""
+    return int(load_todos().get("focus_seconds", 0) or 0)
+
+
+def add_focus_seconds(seconds):
+    """Add to the cumulative focused time and persist it with the tasks."""
+    with _locked():
+        data = load_todos()
+        data["focus_seconds"] = int(data.get("focus_seconds", 0) or 0) + int(seconds)
+        save_todos(data)
+        return data["focus_seconds"]
+
+
 # --------------------------------------------------------------------------- #
 # live timer state (so an agent can `tuido status`)
 # --------------------------------------------------------------------------- #
@@ -399,6 +504,13 @@ class Tui:
         self._message = ""
         self._message_until = 0.0
         self._color = False
+        self._buttons = []
+        self._hover_rows = {}
+        self.editing_add = False
+        self.input_text = ""
+        self.show_help = False
+        self.focus_total = get_focus_seconds()
+        self._tick_until = 0.0
         self._init_colors()
         self._reload(force=True)
         if cfg["autostart"]:
@@ -430,6 +542,8 @@ class Tui:
             curses.curs_set(0)
         self.scr.keypad(True)
         self.scr.timeout(80)
+        with contextlib.suppress(curses.error):
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
         try:
             while self.alive:
                 self._handle_keys()
@@ -459,12 +573,24 @@ class Tui:
             self.scr.addstr(y, x, text[:maxw], attr)
 
     def _put(self, y, x, text, width, attr=0):
-        """Draw ``text`` clipped to ``width`` columns at (y, x)."""
         self._add(y, x, text[:width], attr)
+
+    def _center_at(self, y, cx, text, attr=0):
+        self._add(y, max(0, cx - len(text) // 2), text, attr)
+
+    def _center_line(self, y, w, text, attr=0):
+        self._add(y, max(0, (w - len(text)) // 2), text, attr)
+
+    def _control(self, y, x, label, action, attr=0):
+        """Draw a clickable control and register it for mouse hits."""
+        self._add(y, x, label, attr)
+        self._buttons.append((x, x + len(label) - 1, y, action))
 
     def _draw(self):
         with contextlib.suppress(curses.error):
             self.scr.erase()
+        self._buttons = []
+        self._hover_rows = {}
         h, w = self.scr.getmaxyx()
         if h < 8 or w < 34:
             self._add(0, 0, "terminal too small", curses.A_BOLD)
@@ -477,106 +603,302 @@ class Tui:
         frac = 1.0 - (self.remaining / self.total) if self.total > 0 else 0.0
         frac = max(0.0, min(1.0, frac))
 
-        # top bar
         self._add(0, 1, "T U i D O", acc | curses.A_BOLD)
         spin = SPINNER[tick % len(SPINNER)] if self.running else "*"
-        status = f"{'running' if self.running else 'paused'} {spin} "
+        focus = self.focus_total
+        if self.phase == "work":
+            focus += max(0.0, self.total - self.remaining)
+        done_n = sum(1 for t in self.todos if t["done"])
+        status = (f"{'running' if self.running else 'paused'} {spin}   "
+                  f"focus {format_duration(focus)}   {done_n} done ")
         self._add(0, max(w - len(status) - 1, 1), status, curses.A_DIM)
 
-        content_top = 2
-        content_bottom = h - 3
-        content_h = content_bottom - content_top + 1
-
-        two_col = w >= 56 and content_h >= 12
+        top = 2
+        bottom = h - 4
+        two_col = w >= 56 and (bottom - top + 1) >= 12
         if two_col:
-            self._draw_wide(content_top, content_bottom, w, acc, frac, m, s, tick)
+            self._draw_wide(top, bottom, w, acc, frac, m, s, tick)
         else:
-            self._draw_compact(content_top, content_bottom, w, acc, frac, m, s)
+            self._draw_compact(top, bottom, w, acc, frac, m, s)
 
         self._draw_footer(h, w)
+        if self.show_help:
+            self._draw_help()
 
     def _draw_footer(self, h, w):
-        hint = ("space start/pause  s skip  r reset  a add  d done  x del  "
-                "j/k move  c clear  v view  q quit")
-        self._add(h - 2, 0, hint, curses.A_DIM)
-        if self._message and time.monotonic() < self._message_until:
+        if self.editing_add:
+            self._add(h - 1, 0, "new task  \u00b7  Enter add  \u00b7  Esc cancel",
+                      self._cp(4) | curses.A_BOLD)
+        elif self._message and time.monotonic() < self._message_until:
             self._add(h - 1, 0, self._message, self._cp(4) | curses.A_BOLD)
         else:
-            self._add(h - 1, 0, f"todos: {TODOS_FILE}", curses.A_DIM)
+            hint = "? help"
+            self._add(h - 1, max(w - len(hint) - 1, 0), hint, curses.A_DIM)
+
+    def _draw_pomodoro_controls(self, rx, rw, y, acc):
+        label = " pause " if self.running else " start "
+        spec = [
+            ("[ -5m ]", "-", lambda: self._add_minutes(-5)),
+            ("[ +5m ]", "+", lambda: self._add_minutes(5)),
+            (f"[{label}]", "space", self._toggle),
+            ("[ reset ]", "r", self._reset),
+            ("[ timer ]", "t", self._edit_flow),
+        ]
+        row = " ".join(t for t, _k, _a in spec)
+        x = rx + max(0, (rw - len(row)) // 2)
+        for text, key, action in spec:
+            if x + len(text) > rx + rw - 1:
+                break
+            self._add(y, x, text, acc | curses.A_BOLD)
+            self._buttons.append((x, x + len(text) - 1, y, action))
+            hx = x + max(0, (len(text) - len(key)) // 2)
+            self._add(y + 1, hx, key, curses.A_DIM)
+            x += len(text) + 1
+        return 2
+
+    def _draw_help(self):
+        h, w = self.scr.getmaxyx()
+        rows = [
+            ("TUiDO - keyboard", curses.A_BOLD),
+            ("", 0),
+            ("space    start / pause", 0),
+            ("s        skip phase", 0),
+            ("r        reset phase", 0),
+            ("+ / -    add / remove 5 minutes", 0),
+            ("t        edit timer lengths", 0),
+            ("", 0),
+            ("a        add task", 0),
+            ("e        edit selected task", 0),
+            ("d        toggle done", 0),
+            ("x        delete selected task", 0),
+            ("j / k    move selection", 0),
+            ("g / G    top / bottom", 0),
+            ("c        clear completed", 0),
+            ("v        hide / show done", 0),
+            ("", 0),
+            ("q / esc  quit", 0),
+            ("?        close help", 0),
+        ]
+        inner = max(len(t) for t, _ in rows)
+        box_w = inner + 4
+        x0 = max(1, (w - box_w) // 2)
+        y0 = max(1, (h - (len(rows) + 2)) // 2)
+        for i in range(len(rows) + 2):
+            self._add(y0 + i, x0, " " * box_w, 0)
+        border = "+" + "-" * (box_w - 2) + "+"
+        self._add(y0, x0, border, curses.A_DIM)
+        for i, (text, attr) in enumerate(rows):
+            y = y0 + 1 + i
+            self._add(y, x0, "|", curses.A_DIM)
+            self._add(y, x0 + 2, text.ljust(inner), attr)
+            self._add(y, x0 + box_w - 2, "|", curses.A_DIM)
+        self._add(y0 + len(rows) + 1, x0, border, curses.A_DIM)
 
     # ---------------------------------------------------------- two-column
     def _draw_wide(self, top, bottom, w, acc, frac, m, s, tick):
-        left_w = min(46, max(26, int(w * 0.42)))
+        left_w = max(24, w // 2)
         self._draw_tasks(1, left_w - 1, top, bottom)
+        for yy in range(top, bottom + 1):
+            self._add(yy, left_w, "\u2502", curses.A_DIM)
 
-        div_x = left_w
-        for y in range(top, bottom + 1):
-            self._add(y, div_x, "\u2502", curses.A_DIM)
-
-        rx = div_x + 1
+        rx = left_w + 1
         rw = w - rx
-        if rw < 12:
+        if rw < 16:
             return
         region_h = bottom - top + 1
+        cx = rx + rw // 2
+        self._draw_pomodoro_controls(rx, rw, bottom + 1, acc)
 
-        # Body of the tomato scales to the room we have (phase + tomato + line).
+        small = big_time(f"{m:02d}:{s:02d}")
         max_half = min(TOMATO_MAX_HALF, (rw - 2) // 2)
-        body_h = min(TOMATO_MAX_BODY, region_h - 2 - len(TOMATO_CROWN))
-        crown = max_half >= 5 and body_h >= 6
-        crow = len(TOMATO_CROWN) if crown else 0
-        if not crown:
-            max_half = min(max_half, (rw - 2) // 2)
-        body_h = min(TOMATO_MAX_BODY, region_h - 2 - crow)
-        if max_half < 4 or body_h < 5:
+
+        # Pick a countdown scale that leaves room for the tomato. Kept modest
+        # (max 2x) so the number stays a subtle readout, not a billboard.
+        chosen = None
+        for factor in (2, 1):
+            num = scale_rows(small, factor)
+            num_h, num_w = len(num), len(num[0])
+            if num_w > rw - 2:
+                continue
+            tomato_h = region_h - (1 + 1 + num_h + 1)   # phase, gap, number, pct
+            if tomato_h >= 5:
+                chosen = (num, num_h, tomato_h)
+                break
+        if chosen is None:
             self._draw_big_clock(rx, top, rw, region_h, acc, m, s, frac)
             return
 
-        tomato = render_tomato(build_tomato(body_h, max_half, crown), crow, frac, tick)
-        block_h = 1 + len(tomato) + 1
-        oy = top + max(0, (region_h - block_h) // 2)
-        cx = rx + rw // 2
+        num, num_h, tomato_h = chosen
+        crow = len(TOMATO_CROWN) if (max_half >= 5 and tomato_h - len(TOMATO_CROWN) >= 5) else 0
+        body_h = max(3, min(TOMATO_MAX_BODY, tomato_h - crow))
+        tomato = render_tomato(build_tomato(body_h, max_half, bool(crow)), crow, frac, tick)
 
-        self._center_at(oy, cx, f"{PHASE_NAME[self.phase]}  \u00b7  {self.completed} done",
-                        acc | curses.A_BOLD)
+        # On "done", the check replaces the tomato (the visualizer) only - the
+        # countdown timer stays put below it.
+        if time.monotonic() < self._tick_until:
+            tomato = big_check(2 * max_half + 1, len(tomato))
+            tomato_attr = acc | curses.A_BOLD
+        else:
+            tomato_attr = acc
+
+        block_h = 1 + len(tomato) + 1 + num_h + 1
+        oy = top + max(0, (region_h - block_h) // 2)
+
+        self._center_at(oy, cx, PHASE_NAME[self.phase], acc | curses.A_BOLD)
         oy += 1
         for line in tomato:
+            self._center_at(oy, cx, line, tomato_attr)
+            oy += 1
+        oy += 1
+        for line in num:
             self._center_at(oy, cx, line, acc)
             oy += 1
-        self._center_at(oy, cx, f"{m:02d}:{s:02d}    {int(frac * 100):>3}%",
-                        curses.A_BOLD)
-
-    def _center_at(self, y, cx, text, attr=0):
-        self._add(y, max(0, cx - len(text) // 2), text, attr)
+        self._center_at(oy, cx, f"{int(frac * 100):>3}%   {self.completed} pomodoros",
+                        curses.A_DIM)
 
     def _draw_tasks(self, x, width, top, bottom):
         open_n = sum(1 for t in self.todos if not t["done"])
         done_n = len(self.todos) - open_n
         self._put(top, x, f"TODOS  {open_n} open \u00b7 {done_n} done",
                   width, curses.A_BOLD)
-        avail = bottom - (top + 1) + 1
+
+        y0 = top + 1
+        # Inline "add" field lives at the top of the list, where the new task
+        # will actually appear - not at the bottom of the screen.
+        if self.editing_add:
+            prefix = "   [ ] "
+            field = (prefix + self.input_text)[:width - 1]
+            self._put(y0, x, field, width, self._cp(4) | curses.A_BOLD)
+            cur_x = x + len(prefix) + min(len(self.input_text),
+                                          max(0, width - 1 - len(prefix)))
+            self._put(y0, cur_x, "\u2588", 1, self._cp(4) | curses.A_BOLD)
+            y0 += 1
+
+        avail = bottom - y0 + 1
+        if avail <= 0:
+            return
         vis = self._visible()
         if not vis:
-            self._put(top + 1, x + 2, "no tasks - press a", width - 2, curses.A_DIM)
+            if not self.editing_add:
+                self._put(y0, x + 2, "no tasks yet", width - 2, curses.A_DIM)
+                self._control(y0 + 2, x + 2, "[a] add", self._begin_add, self._cp(4))
             return
-        start = 0
-        if self.sel >= avail and avail > 0:
-            start = self.sel - avail + 1
-        for pos, idx in enumerate(vis[start:start + max(0, avail)]):
+
+        # Wrap each task to the panel width; the selected task also gets a
+        # one-row action menu ("signifiers") right below it.
+        prefix_w = 8                       # "  3 [x] "
+        text_w = max(8, width - prefix_w - 1)
+        lines = []                         # (task_pos, text, kind, first?)
+        for pos, idx in enumerate(vis):
             t = self.todos[idx]
-            real = start + pos
             box = "[x]" if t["done"] else "[ ]"
+            body = t["text"] or "(untitled)"
+            wrapped = textwrap.wrap(body, width=text_w) or [""]
+            for j, seg in enumerate(wrapped):
+                text = (f"{t['id']:>3} {box} {seg}" if j == 0
+                        else " " * prefix_w + seg)
+                lines.append((pos, text, "task", j == 0))
+        last_sel = max((i for i, ln in enumerate(lines) if ln[0] == self.sel),
+                       default=-1)
+        if last_sel >= 0:
+            lines.insert(last_sel + 1, (self.sel, "", "action", False))
+
+        # Scroll so the selected task's whole block stays on screen.
+        sel_first = max((i for i, ln in enumerate(lines) if ln[0] == self.sel),
+                        default=0)
+        sel_last = sel_first
+        for i in range(sel_first, len(lines)):
+            if lines[i][0] != self.sel:
+                break
+            sel_last = i
+        scroll = 0
+        if sel_last >= avail:
+            scroll = sel_last - avail + 1
+        if sel_first < scroll:
+            scroll = sel_first
+        scroll = max(0, min(scroll, max(0, len(lines) - avail)))
+
+        for row, (pos, text, kind, first) in enumerate(lines[scroll:scroll + avail]):
+            y = y0 + row
+            if kind == "action":
+                menu = "[e] edit   [x] delete   [d] done"
+                self._put(y, x + 2, menu, width - 2, self._cp(4))
+                base = x + 2
+                for key, off, act in (
+                    ("e", 0, lambda p=pos: self._edit_task_flow(p)),
+                    ("x", 11, lambda p=pos: self._delete_at(p)),
+                    ("d", 24, lambda p=pos: self._toggle_at(p)),
+                ):
+                    self._buttons.append((base + off, base + off + 2, y, act))
+                continue
+            t = self.todos[vis[pos]]
             attr = curses.A_DIM if t["done"] else 0
-            if real == self.sel:
+            if pos == self.sel:
                 attr |= curses.A_REVERSE
-            self._put(top + 1 + pos, x, f"{t['id']:>3} {box} {t['text']}", width, attr)
+            self._put(y, x, text, width, attr)
+            self._hover_rows[y] = pos
+
+        # New-task control: sits under the tasks, in the empty space below the
+        # last one (not in a global bottom bar).
+        if not self.editing_add:
+            add_y = y0 + min(len(lines) - scroll, avail)
+            if add_y <= bottom:
+                self._control(add_y, x + 2, "[a] add", self._begin_add, self._cp(4))
+
+    def _toggle_at(self, pos):
+        vis = self._visible()
+        if 0 <= pos < len(vis):
+            self.sel = pos
+            self._toggle_done()
+
+    def _delete_at(self, pos):
+        vis = self._visible()
+        if 0 <= pos < len(vis):
+            self.sel = pos
+            self._delete_sel()
+
+    def _edit_task_flow(self, pos):
+        vis = self._visible()
+        if not (0 <= pos < len(vis)):
+            self._message_set("no task selected")
+            return
+        self.sel = pos
+        t = self.todos[vis[pos]]
+        tid = t["id"]
+        text = self._prompt("edit task: ", initial=t["text"])
+        if text and text.strip():
+            store_edit(tid, text)
+            self._reload(force=True)
+            self._message_set(f"edited #{tid}")
+
+    def _draw_big_clock(self, rx, top, rw, region_h, acc, m, s, frac):
+        cx = rx + rw // 2
+        small = big_time(f"{m:02d}:{s:02d}")
+        factor = 2 if len(small[0]) * 2 <= rw - 2 else 1
+        num = scale_rows(small, factor)
+        block = 1 + len(num) + 1
+        y = top + max(0, (region_h - block) // 2)
+        self._center_at(y, cx, PHASE_NAME[self.phase], acc | curses.A_BOLD)
+        y += 1
+        if time.monotonic() < self._tick_until:
+            self._center_at(y + len(num) // 2, cx, "\u2713", acc | curses.A_BOLD)
+            y += len(num)
+        else:
+            for line in num:
+                self._center_at(y, cx, line, acc)
+                y += 1
+        self._center_at(y, cx, f"{int(frac * 100):>3}%", curses.A_DIM)
 
     # ------------------------------------------------------------ compact
     def _draw_compact(self, top, bottom, w, acc, frac, m, s):
+        small = big_time(f"{m:02d}:{s:02d}")
+        factor = 2 if len(small[0]) * 2 <= w - 2 else 1
+        num = scale_rows(small, factor)
         y = top
         self._center_line(y, w, PHASE_NAME[self.phase], acc | curses.A_BOLD)
         y += 1
-        if (bottom - y) >= 8:
-            for line in big_time(f"{m:02d}:{s:02d}"):
+        if (bottom - y) >= len(num) + 3:
+            for line in num:
                 self._center_line(y, w, line, acc | curses.A_BOLD)
                 y += 1
         else:
@@ -585,21 +907,9 @@ class Tui:
         bar_w = min(w - 8, 44)
         filled = int(round(bar_w * frac))
         self._center_line(y, w, "\u2588" * filled + "\u2591" * (bar_w - filled), acc)
-        y += 2
-        self._draw_tasks(2, w - 4, y, bottom)
-
-    def _center_line(self, y, w, text, attr=0):
-        self._add(y, max(0, (w - len(text)) // 2), text, attr)
-
-    def _draw_big_clock(self, rx, top, rw, region_h, acc, m, s, frac):
-        cx = rx + rw // 2
-        y = top + max(0, (region_h - 8) // 2)
-        self._center_at(y, cx, PHASE_NAME[self.phase], acc | curses.A_BOLD)
         y += 1
-        for line in big_time(f"{m:02d}:{s:02d}"):
-            self._center_at(y, cx, line, acc | curses.A_BOLD)
-            y += 1
-        self._center_at(y, cx, f"{int(frac * 100):>3}%", curses.A_DIM)
+        y += self._draw_pomodoro_controls(2, w - 4, y, acc) + 1
+        self._draw_tasks(2, w - 4, y, bottom)
 
     # --------------------------------------------------------------- todos
     def _visible(self):
@@ -653,6 +963,8 @@ class Tui:
         if cur is None:
             return
         new = not cur["done"]
+        if new:
+            self._tick_until = time.monotonic() + 1.0   # flash a tick for 1s
         store_set_done([tid], new)
         self._reload(force=True)
         self._message_set(f"#{tid} " + ("done" if new else "reopened"))
@@ -674,21 +986,36 @@ class Tui:
         self.sel += delta
         self._clamp_sel()
 
-    def _add_flow(self):
-        text = self._prompt("new task: ")
-        if text and text.strip():
-            ids = store_add([text])
-            self._reload(force=True)
-            if ids:
-                self._message_set(f"added #{ids[0]}")
+    def _begin_add(self):
+        self.editing_add = True
+        self.input_text = ""
 
-    def _prompt(self, label):
+    def _handle_add_key(self, ch):
+        if ch == 27:                                  # Esc cancels
+            self.editing_add = False
+            self.input_text = ""
+        elif ch in (10, 13, curses.KEY_ENTER):        # Enter commits
+            text = self.input_text.strip()
+            self.editing_add = False
+            self.input_text = ""
+            if text:
+                ids = store_add([text], top=True)     # appears where it was typed
+                self._reload(force=True)
+                if ids:
+                    self.sel = 0
+                    self._message_set(f"added #{ids[0]}")
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            self.input_text = self.input_text[:-1]
+        elif 32 <= ch < 127:
+            self.input_text += chr(ch)
+
+    def _prompt(self, label, initial=""):
         h, w = self.scr.getmaxyx()
         with contextlib.suppress(curses.error):
             curses.curs_set(1)
         self.scr.nodelay(False)
         self.scr.timeout(-1)
-        text = ""
+        text = initial
         row = h - 1
         try:
             while True:
@@ -713,6 +1040,101 @@ class Tui:
                 curses.curs_set(0)
         return text
 
+    # ------------------------------------------------ edit timer (remembered)
+    def _edit_flow(self):
+        fields = [("work", "Work"), ("short", "Short break"),
+                  ("long", "Long break"), ("cycles", "Cycles")]
+        draft = {
+            "work": max(1, round(self.durations["work"] / 60)),
+            "short": max(1, round(self.durations["short"] / 60)),
+            "long": max(1, round(self.durations["long"] / 60)),
+            "cycles": int(self.cfg["cycles"]),
+        }
+        idx = 0
+        self.scr.nodelay(False)
+        self.scr.timeout(-1)
+        with contextlib.suppress(curses.error):
+            curses.curs_set(0)
+        try:
+            while True:
+                self._draw_edit(fields, draft, idx)
+                ch = self.scr.getch()
+                if ch == curses.KEY_MOUSE:
+                    continue
+                if ch in (27, ord("q")):
+                    return
+                if ch in (10, 13, curses.KEY_ENTER):
+                    self._apply_edit(draft)
+                    return
+                if ch in (ord("j"), curses.KEY_DOWN):
+                    idx = (idx + 1) % len(fields)
+                elif ch in (ord("k"), curses.KEY_UP):
+                    idx = (idx - 1) % len(fields)
+                elif ch in (ord("+"), ord("="), ord("l"), curses.KEY_RIGHT):
+                    self._bump(draft, fields[idx][0], 1)
+                elif ch in (ord("-"), ord("h"), curses.KEY_LEFT):
+                    self._bump(draft, fields[idx][0], -1)
+        finally:
+            self.scr.nodelay(True)
+            self.scr.timeout(80)
+
+    @staticmethod
+    def _bump(draft, key, delta):
+        if key == "cycles":
+            draft[key] = max(0, min(12, draft[key] + delta))
+        else:
+            draft[key] = max(1, min(180, draft[key] + delta))
+
+    def _draw_edit(self, fields, draft, idx):
+        with contextlib.suppress(curses.error):
+            self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        acc = self._cp(self._accent_pair())
+        head = "Edit timer"
+        tip = "j/k move   -/+ adjust   Enter save   Esc cancel"
+        lines = []
+        for i, (key, label) in enumerate(fields):
+            value = f"{draft[key]} min" if key != "cycles" else f"{draft[key]}"
+            text = f"  {label:<12}{value:>7}  "
+            attr = curses.A_REVERSE if i == idx else 0
+            lines.append((text, attr))
+        inner = max(len(head), len(tip), *(len(t) for t, _ in lines))
+        box_w = inner + 4
+        x0 = max(1, (w - box_w) // 2)
+        y0 = max(1, (h - (len(lines) + 4)) // 2)
+        border = "+" + "-" * (box_w - 2) + "+"
+        self._add(y0, x0, border, curses.A_DIM)
+        self._add(y0 + 1, x0, "|", curses.A_DIM)
+        self._add(y0 + 1, x0 + 2, head.ljust(inner), acc | curses.A_BOLD)
+        self._add(y0 + 1, x0 + box_w - 2, "|", curses.A_DIM)
+        for i, (text, attr) in enumerate(lines):
+            row = y0 + 2 + i
+            self._add(row, x0, "|", curses.A_DIM)
+            self._add(row, x0 + 2, text.ljust(inner), attr)
+            self._add(row, x0 + box_w - 2, "|", curses.A_DIM)
+        tip_row = y0 + 2 + len(lines)
+        self._add(tip_row, x0, "|", curses.A_DIM)
+        self._add(tip_row, x0 + 2, tip.ljust(inner), curses.A_DIM)
+        self._add(tip_row, x0 + box_w - 2, "|", curses.A_DIM)
+        self._add(y0 + len(lines) + 3, x0, border, curses.A_DIM)
+        self.scr.refresh()
+
+    def _apply_edit(self, draft):
+        self.cfg["cycles"] = int(draft["cycles"])
+        for key in ("work", "short", "long"):
+            self.durations[key] = to_seconds(draft[key])
+        if self.phase in ("work", "short", "long"):
+            new = float(self.durations[self.phase])
+            self.total = new
+            self.remaining = new
+            if self.running:
+                self.deadline = time.monotonic() + self.remaining
+        save_settings({
+            "work": int(draft["work"]), "short": int(draft["short"]),
+            "long": int(draft["long"]), "cycles": int(draft["cycles"]),
+        })
+        self._message_set("timer updated (remembered)")
+
     # ---------------------------------------------------------------- keys
     def _handle_keys(self):
         while True:
@@ -722,17 +1144,36 @@ class Tui:
                 return
             if ch == -1 or ch == curses.KEY_RESIZE:
                 return
+            if self.editing_add:
+                self._handle_add_key(ch)
+                return
+            if self.show_help:
+                self.show_help = False
+                return
+            if ch == curses.KEY_MOUSE:
+                self._handle_mouse()
+                continue
             if ch in (ord("q"), 27):
                 self.alive = False
                 return
-            if ch == ord(" "):
+            if ch == ord("?"):
+                self.show_help = True
+            elif ch == ord(" "):
                 self._toggle()
             elif ch == ord("s"):
                 self._skip()
             elif ch == ord("r"):
                 self._reset()
+            elif ch in (ord("+"), ord("=")):
+                self._add_minutes(5)
+            elif ch == ord("-"):
+                self._add_minutes(-5)
+            elif ch == ord("e"):
+                self._edit_task_flow(self.sel)
+            elif ch == ord("t"):
+                self._edit_flow()
             elif ch == ord("a"):
-                self._add_flow()
+                self._begin_add()
             elif ch == ord("d"):
                 self._toggle_done()
             elif ch in (ord("x"), curses.KEY_DC, curses.KEY_BACKSPACE, 127):
@@ -750,6 +1191,23 @@ class Tui:
             elif ch == ord("v"):
                 self.show_all = not self.show_all
                 self._clamp_sel()
+
+    def _handle_mouse(self):
+        try:
+            _id, x, y, _z, bstate = curses.getmouse()
+        except curses.error:
+            return
+        clicked = bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED
+                            | curses.BUTTON1_RELEASED)
+        if clicked:
+            for x0, x1, by, action in self._buttons:
+                if by == y and x0 <= x <= x1:
+                    action()
+                    return
+        pos = self._hover_rows.get(y)
+        if pos is not None:
+            self.sel = pos
+            self._clamp_sel()
 
     # --------------------------------------------------------------- timer
     def start(self):
@@ -774,6 +1232,13 @@ class Tui:
         self.remaining = self.total
         self._message_set("reset")
 
+    def _add_minutes(self, delta):
+        self.total = max(60.0, self.total + delta * 60)
+        self.remaining = max(1.0, self.remaining + delta * 60)
+        if self.running:
+            self.deadline = time.monotonic() + self.remaining
+        self._message_set(f"{delta:+d} min")
+
     def _skip(self):
         self.running = False
         self.deadline = None
@@ -789,6 +1254,7 @@ class Tui:
         self.deadline = None
         if finished == "work":
             self.completed += 1
+            self.focus_total = add_focus_seconds(int(self.total))
         self.phase = next_phase(finished, self.completed, self.cfg["cycles"])
         self.total = float(self.durations[self.phase])
         self.remaining = self.total
@@ -811,7 +1277,10 @@ class Tui:
                 "remaining": max(0, int(round(self.remaining))),
                 "total": int(self.total),
                 "completed_work": self.completed,
+                "focus_seconds": int(self.focus_total + (self.total - self.remaining
+                                                         if self.phase == "work" else 0)),
                 "todos_open": sum(1 for t in self.todos if not t["done"]),
+                "todos_done": sum(1 for t in self.todos if t["done"]),
                 "updated": time.time(),
                 "pid": os.getpid(),
             })
@@ -832,19 +1301,35 @@ class Tui:
 
 
 def run_tui(args):
+    saved = effective_settings()
+
+    def pick(flag_value, key):
+        return flag_value if flag_value is not None else saved.get(key, NUM_DEFAULTS[key])
+
     cfg = {
-        "work": to_seconds(args.work),
-        "short": to_seconds(args.short),
-        "long": to_seconds(args.long_break),
-        "cycles": args.cycles,
-        "sound": args.sound,
+        "work": to_seconds(pick(args.work, "work")),
+        "short": to_seconds(pick(args.short, "short")),
+        "long": to_seconds(pick(args.long_break, "long")),
+        "cycles": int(pick(args.cycles, "cycles")),
+        "sound": args.sound if args.sound is not None else DEFAULT_SOUND,
         "mute": args.mute,
         "autostart": not args.paused,
     }
     with contextlib.suppress(Exception):
         locale.setlocale(locale.LC_ALL, "")
+    # Make the Esc key responsive: ncurses otherwise waits ~1s to decide whether
+    # a lone ESC begins a key sequence, which feels like Esc "doesn't work".
+    os.environ.setdefault("ESCDELAY", "25")
+
+    def _start(scr):
+        with contextlib.suppress(Exception):
+            curses.set_escdelay(25)
+        with contextlib.suppress(curses.error):
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        Tui(scr, cfg).run()
+
     try:
-        curses.wrapper(lambda scr: Tui(scr, cfg).run())
+        curses.wrapper(_start)
     except curses.error as exc:
         print(f"{APP_NAME}: cannot start the TUI ({exc}). Run it in a real terminal.",
               file=sys.stderr)
@@ -867,15 +1352,15 @@ def cmd_tui(argv):
     p = argparse.ArgumentParser(prog=APP_NAME, usage="%(prog)s [timer options]",
                                 description="Run the TUiDO TUI.",
                                 epilog="commands: tui add ls done undone edit rm "
-                                       "clear clear-all status path banner")
+                                       "clear clear-all status config path banner")
     p.add_argument("--paused", action="store_true", help="open without starting")
-    p.add_argument("-w", "--work", type=float, default=DEFAULT_WORK, metavar="MIN")
+    p.add_argument("-w", "--work", type=float, default=None, metavar="MIN")
     p.add_argument("-b", "--break", "--short-break", dest="short", type=float,
-                   default=DEFAULT_SHORT, metavar="MIN")
+                   default=None, metavar="MIN")
     p.add_argument("-l", "--long", "--long-break", dest="long_break", type=float,
-                   default=DEFAULT_LONG, metavar="MIN")
-    p.add_argument("-c", "--cycles", type=int, default=DEFAULT_CYCLES, metavar="N")
-    p.add_argument("-s", "--sound", default=DEFAULT_SOUND, metavar="NAME")
+                   default=None, metavar="MIN")
+    p.add_argument("-c", "--cycles", type=int, default=None, metavar="N")
+    p.add_argument("-s", "--sound", default=None, metavar="NAME")
     p.add_argument("--mute", "--no-sound", dest="mute", action="store_true")
     return run_tui(p.parse_args(argv))
 
@@ -985,9 +1470,12 @@ def cmd_status(argv):
     state = read_state()
     data = load_todos()
     open_n = sum(1 for t in data["todos"] if not t["done"])
+    done_n = sum(1 for t in data["todos"] if t["done"])
+    focus = int(data.get("focus_seconds", 0) or 0)
     if a.json:
-        print(json.dumps({"timer": state, "open": open_n,
-                          "total": len(data["todos"])}, indent=2, ensure_ascii=False))
+        print(json.dumps({"timer": state, "open": open_n, "done": done_n,
+                          "total": len(data["todos"]), "focus_seconds": focus},
+                         indent=2, ensure_ascii=False))
         return 0
     if state:
         m, s = divmod(max(0, int(state.get("remaining", 0))), 60)
@@ -996,14 +1484,78 @@ def cmd_status(argv):
               f"(completed {state.get('completed_work', 0)})")
     else:
         print("timer: not running")
-    print(f"todos: {open_n} open / {len(data['todos'])} total")
+    print(f"focus: {format_duration(focus)}")
+    print(f"todos: {open_n} open / {done_n} done / {len(data['todos'])} total")
+    return 0
+
+
+def cmd_focus(argv):
+    p = argparse.ArgumentParser(prog=f"{APP_NAME} focus",
+                                description="Show or reset cumulative focused time.")
+    p.add_argument("--reset", action="store_true", help="set the total back to zero")
+    p.add_argument("--json", action="store_true")
+    a = p.parse_args(argv)
+    if a.reset:
+        with _locked():
+            data = load_todos()
+            data["focus_seconds"] = 0
+            save_todos(data)
+        print("focus time reset")
+        return 0
+    total = get_focus_seconds()
+    if a.json:
+        print(json.dumps({"focus_seconds": total}))
+    else:
+        print(format_duration(total))
+    return 0
+
+
+def cmd_config(argv):
+    p = argparse.ArgumentParser(prog=f"{APP_NAME} config",
+                                description="Show or set remembered timer lengths (minutes).")
+    p.add_argument("key", nargs="?",
+                   help="one of: work, short, long, cycles (omit to list all)")
+    p.add_argument("value", nargs="?", help="new value for the key")
+    p.add_argument("--reset", action="store_true", help="forget saved settings")
+    a = p.parse_args(argv)
+
+    if a.reset:
+        with contextlib.suppress(OSError):
+            os.unlink(SETTINGS_FILE)
+        print("settings reset to defaults")
+        return 0
+
+    if a.key is None:
+        for key, value in effective_settings().items():
+            print(f"{key} = {value}")
+        return 0
+
+    if a.key not in NUM_DEFAULTS:
+        print(f"{APP_NAME}: unknown setting {a.key!r} "
+              f"(expected one of: {', '.join(NUM_DEFAULTS)})", file=sys.stderr)
+        return 2
+
+    if a.value is None:
+        print(effective_settings()[a.key])
+        return 0
+
+    try:
+        value = int(a.value) if a.key == "cycles" else float(a.value)
+    except ValueError:
+        print(f"{APP_NAME}: {a.key!r} needs a number", file=sys.stderr)
+        return 2
+    saved = load_settings()
+    saved[a.key] = value
+    save_settings(saved)
+    print(f"{a.key} = {value}")
     return 0
 
 
 def cmd_path(argv):
     print(DATA_DIR)
-    print(f"  todos: {TODOS_FILE}")
-    print(f"  state: {STATE_FILE}")
+    print(f"  todos:    {TODOS_FILE}")
+    print(f"  state:    {STATE_FILE}")
+    print(f"  settings: {SETTINGS_FILE}")
     return 0
 
 
@@ -1033,6 +1585,9 @@ DISPATCH = {
     "clear-all": cmd_clear_all,
     "wipe": cmd_clear_all,
     "status": cmd_status,
+    "config": cmd_config,
+    "focus": cmd_focus,
+    "settings": cmd_config,
     "path": cmd_path,
     "banner": cmd_banner,
     "version": cmd_version,

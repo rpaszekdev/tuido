@@ -11,27 +11,31 @@
 **A terminal Pomodoro timer with an agent-shareable todo list.**
 
 TUiDO is a single-file, dependency-free terminal app that pairs a focus timer
-with a live todo list — your tasks on the left, a big ASCII tomato that fills
-with `#` as the timer runs on the right. The same todo list is exposed through a
-scriptable CLI, so **you or an AI agent can add and complete items while the
-timer is running** — the TUI watches the file and reloads live.
+with a live todo list — your tasks on the left, and on the right a big ASCII
+pomodoro that fills with `#` as the timer runs, with a large countdown below it.
+The same todo list is exposed through a scriptable CLI, so **you or an AI agent
+can add and complete items while the timer is running** — the TUI watches the
+file and reloads live.
 
 ```
- T U i D O                                                    running -
- TODOS  3 open · 1 done          │               WORK  ·  2 done
-   1 [ ] ship the two-column UI  │                    \ | /
-   2 [ ] tune the fill animation │                     \|/
-   3 [x] write the AGENTS snippet│                      |
-                                 │                ##~##~##~##
-                                 │              ################
-                                 │              ################
-                                 │               ##############
-                                 │                 ##########
-                                 │                     ####
-                                 │               14:30   41%
- space start/pause  s skip  r reset  a add  d done  x del  j/k move  c clear  q quit
- todos: ~/.local/share/tuido/todos.json
+ T U i D O                                  running \   focus 1:30:45   2 done
+
+ TODOS  1 open · 2 done     │                    WORK
+   3 [ ] studying modules   │                      .
+  [e] edit [x] del [d] done │             .....................
+  [a] add                   │           ##~##~##~##~##~##~##~#
+                            │    ######  ######          ######  ######
+   (todo controls, left)    │    ######  ######          ######  ######
+                            │             28%   0 pomodoros
+                            │  [ -5m ] [ +5m ] [ pause ] [ reset ] [ timer ]
+                                                                    (pomodoro, right)
+                                                             ? help
 ```
+
+Controls are split by side — todo actions live in the left column (with `[a] add`
+in the empty space under the last task), pomodoro controls in the right. The
+bottom is kept quiet; press `?` for the full key list (progressive disclosure).
+On `d`, the check briefly replaces the tomato while the countdown stays put.
 
 ## Features
 
@@ -39,25 +43,38 @@ timer is running** — the TUI watches the file and reloads live.
   work sessions. Work → break → work cycles advance automatically, with a sound
   alert on each transition.
 - **Todo list** — add, complete, edit and delete tasks from inside the TUI, or
-  from the shell.
+  from the shell. Long text wraps; the hovered/selected task shows an inline
+  `[e] edit  [x] delete  [d] done` menu.
+- **Big countdown + filling pomodoro** — the right pane shows a leaf-crowned
+  tomato that fills bottom-up with `#` (with a shimmering fill surface), and a
+  large ASCII countdown below it that scales to your terminal.
+- **Add time on the fly** — `+` / `-` (or the on-screen `[ -5m ]` / `[ +5m ]`
+  buttons) extend or trim the current session by 5 minutes.
+- **Focus stats** — the top-right corner shows cumulative focused time and the
+  number of tasks completed. Both are saved next to your tasks in
+  `todos.json`, so they survive restarts (`tuido focus` / `tuido status`).
+  Pressing `d` flashes a big ASCII checkmark across the whole right column
+  for a second as feedback.
+- **Edit and remember your timer** — press `t` (or click `[ timer ]`) to set the
+  work / short / long / cycles lengths; they are saved to `settings.json` and
+  reused next launch. Also settable from the CLI: `tuido config work 50`.
 - **Agent-friendly** — the todo list and live timer state are plain JSON files.
   Any external process can run `tuido add "..."` and it appears in the running
   TUI instantly; `tuido status` lets an agent see what is in focus right now.
-- **ASCII-art vibe** — a figlet-style wordmark, a leaf-crowned pomodoro that
-  fills bottom-up with hashtags (with a shimmering fill surface), an ASCII
-  bitmap clock, and a responsive two-column layout.
+- **Mouse + keyboard** — hover a task to focus it, click the inline menu or the
+  footer buttons, or use keys for everything.
 - **Zero dependencies** — pure Python standard library (`curses`), no pip.
 
 ## Requirements
 
 - Python 3.8+ with the `curses` module (ships with CPython on macOS and Linux).
 - macOS or Linux. On macOS the alert uses `afplay`; elsewhere it falls back to a
-  terminal beep via `osascript`/no-op.
+  terminal beep.
 
 ## Install
 
 ```sh
-git clone https://github.com/<you>/tuido.git
+git clone https://github.com/rpaszekdev/tuido.git
 cd tuido
 ./install.sh          # symlinks bin/tuido into ~/.local/bin
 ```
@@ -77,7 +94,7 @@ Run it straight from the checkout without installing:
 ```sh
 tuido                       # open the timer (starts immediately)
 tuido --paused              # open paused
-tuido -w 50 -b 10 -l 20 -c 3
+tuido -w 50 -b 10 -l 20 -c 3   # override just for this run
 tuido --sound Ping          # any name in /System/Library/Sounds
 tuido --mute                # no sound at session end
 ```
@@ -88,10 +105,18 @@ Keys:
 |-----|--------|-----|--------|
 | `space` | start / pause | `a` | add task |
 | `s` | skip phase | `d` | toggle done |
-| `r` | reset phase | `x` | delete task |
-| `j` / `k` | move selection | `c` | clear completed |
-| `g` / `G` | jump to top / bottom | `v` | hide / show done |
+| `r` | reset phase | `e` | edit selected task |
+| `+` / `-` | add / remove 5 min | `x` | delete task |
+| `j` / `k` | move selection | `t` | edit timer lengths |
+| `g` / `G` | jump to top / bottom | `c` | clear completed |
+| `?` | help overlay | `v` | hide / show done |
 | `q` / `esc` | quit | | |
+
+Long task text wraps to as many lines as it needs. Controls are grouped by side:
+the selected task shows an inline `[e] edit  [x] delete  [d] done` menu, and
+`[a] add` sits under the tasks (left column); `[ -5m ] [ +5m ] [ pause/start ]
+[ reset ] [ timer ]` sit under the pomodoro (right column). All of them are
+clickable with the mouse. Press `?` for the full key list.
 
 ### CLI
 
@@ -106,7 +131,13 @@ tuido edit 3 "new text"
 tuido rm 3
 tuido clear                         # delete completed
 tuido clear-all --yes               # wipe everything
-tuido status [--json]               # live timer + counts
+tuido status [--json]               # live timer + focus time + counts
+tuido focus [--reset] [--json]      # cumulative focused time
+
+tuido config                        # show remembered timer lengths
+tuido config work 50                # set + remember (minutes)
+tuido config --reset                # back to defaults
+
 tuido path                          # print data file paths
 tuido banner                        # print the wordmark
 ```
@@ -132,7 +163,8 @@ Everything lives in `~/.local/share/tuido/`:
 
 | file | purpose |
 |------|---------|
-| `todos.json` | your todo list (source of truth) |
+| `todos.json` | your todo list, plus cumulative `focus_seconds` and the done counter |
+| `settings.json` | remembered timer lengths (work / short / long / cycles) |
 | `state.json` | live timer state, written while a TUI runs, removed on exit |
 | `.lock` | advisory lock guarding concurrent writes |
 
@@ -142,7 +174,7 @@ agent can safely write at the same time.
 ## Architecture
 
 - `tuido.py` — the whole application: curses UI, JSON todo store, timer state
-  machine, and the CLI (one file, standard library only).
+  machine, settings, and the CLI (one file, standard library only).
 - `bin/tuido` — a launcher that finds a Python with `curses` and runs `tuido.py`.
 - `install.sh` — symlinks the launcher onto your `PATH`.
 

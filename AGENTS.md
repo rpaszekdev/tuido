@@ -13,6 +13,7 @@ to the human in their running TUI, which live-reloads on every change.
 ./bin/tuido ls --open                # list pending tasks
 ./bin/tuido done <id>                # mark finished
 ./bin/tuido status                   # current timer + counts
+./bin/tuido config                   # remembered timer lengths
 ```
 
 Guidelines:
